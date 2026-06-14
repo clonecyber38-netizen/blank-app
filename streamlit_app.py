@@ -390,44 +390,53 @@ if page == "Pengembalian":
     st.markdown("<h1 class='section-title'>Form Pengembalian Alat</h1>", unsafe_allow_html=True)
     st.caption(f"Waktu sekarang: {now_str()}")
     
+    # Ambil peminjaman aktif diluar FORM agar Selectbox langsung memicu interaksi dinamis
     loans_df = get_loans_df()
     active_loans = loans_df[loans_df["status"] == "dipinjam"]
 
     if active_loans.empty:
         st.info("Tidak ada peminjaman aktif saat ini.")
     else:
-        with st.form("form_kembali", clear_on_submit=True):
-            st.markdown("<div class='form-box'>", unsafe_allow_html=True)
-            
-            options = active_loans.apply(
-                lambda r: f'{r["loan_id"]} - {r["nama"]} ({r["nim"]}) - {r["alat"]}',
-                axis=1
-            ).tolist()
-            
-            sel = st.selectbox("Pilih data peminjaman aktif:", options=options)
-            selected_id = int(sel.split(" - ")[0])
+        options = active_loans.apply(
+            lambda r: f'{r["loan_id"]} - {r["nama"]} ({r["nim"]}) - {r["alat"]}',
+            axis=1
+        ).tolist()
+        
+        # PENTING: Selectbox diletakkan di luar st.form agar ketika dipilih, halaman langsung me-render ulang data alat milik ID tersebut
+        sel = st.selectbox("Pilih data peminjaman aktif:", options=options, key="select_pengembalian_aktif")
+        selected_id = int(sel.split(" - ")[0])
 
-            conn = get_conn()
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM loans WHERE loan_id = ?", (selected_id,))
-            loan_row = cur.fetchone()
-            conn.close()
+        # Ambil baris data log terbaru dari database untuk dicocokkan
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM loans WHERE loan_id = ?", (selected_id,))
+        loan_row = cur.fetchone()
+        conn.close()
 
+        # Konversi struktur data barang ke Dictionary Python dengan aman
+        try:
+            items = json.loads(loan_row["items"])
+        except:
             try:
-                items = json.loads(loan_row["items"])
+                items = eval(loan_row["items"])
             except:
-                try:
-                    items = eval(loan_row["items"])
-                except:
-                    items = {}
-                
+                items = {}
+
+        # Saring item yang tersisa > 0 saja
+        items = {k: v for k, v in items.items() if v > 0}
+
+        # Mulai pembungkusan input angka pengembalian ke dalam Form agar eksekusi data berjalan rapi
+        with st.form(f"form_kembali_id_{selected_id}", clear_on_submit=True):
+            st.markdown("<div class='form-box'>", unsafe_allow_html=True)
+            st.markdown(f"### Detail alat yang harus dikembalikan (ID Peminjaman: {selected_id}):")
+            
             returned = {}
-            st.markdown("### Detail alat yang harus dikembalikan:")
             cols = st.columns(3)
             
+            # Tampilkan kolom peminjaman alat secara spesifik HANYA untuk ID yang sedang terpilih
             for i, alat in enumerate(items.keys()):
                 c = cols[i % 3]
-                max_return = items[alat]
+                max_return = int(items[alat])
                 
                 qty = c.number_input(
                     f"{alat} (maks {max_return})",
@@ -435,12 +444,12 @@ if page == "Pengembalian":
                     max_value=max_return,
                     value=max_return,
                     step=1,
-                    key=f"ret_input_{selected_id}_{alat}"
+                    key=f"input_numeric_{selected_id}_{alat}" # Kunci mutlak unik terikat pada ID & Nama Alat
                 )
                 if qty > 0:
                     returned[alat] = int(qty)
 
-            kondisi = st.selectbox("Kondisi alat setelah dikembalikan", ["baik", "rusak ringan", "rusak berat"])
+            kondisi = st.selectbox("Kondisi alat setelah dikembalikan", ["baik", "rusak ringan", "rusak berat"], key=f"kondisi_{selected_id}")
             st.markdown("</div>", unsafe_allow_html=True)
             
             submit_ret = st.form_submit_button("Konfirmasi Pengembalian")
@@ -452,17 +461,22 @@ if page == "Pengembalian":
                     conn = get_conn()
                     cur = conn.cursor()
                     
+                    # Update sisa stok inventaris laboratorium utama
                     for alat, q in returned.items():
                         cur.execute("UPDATE inventory SET available = available + ? WHERE item_name = ?", (q, alat))
-                        items[alat] -= q
+                        if alat in items:
+                            items[alat] -= q
 
+                    # Bersihkan item yang kuantitasnya sudah nol
                     items = {k: v for k, v in items.items() if v > 0}
 
+                    # Jika semua barang sudah lunas dikembalikan, ubah status utama transaksi
                     if not items:
                         cur.execute("UPDATE loans SET status = ? WHERE loan_id = ?", ("dikembalikan", selected_id))
                     else:
                         cur.execute("UPDATE loans SET items = ? WHERE loan_id = ?", (json.dumps(items), selected_id))
 
+                    # Tulis laporan ke tabel riwayat returns
                     cur.execute(
                         "INSERT INTO returns (loan_id, nama, items, waktu_kembali, kondisi) VALUES (?, ?, ?, ?, ?)",
                         (selected_id, loan_row["nama"], json.dumps(returned), now_str(), kondisi)
@@ -470,7 +484,7 @@ if page == "Pengembalian":
                     conn.commit()
                     conn.close()
                     
-                    st.success("Pengembalian berhasil dicatat!")
+                    st.success(f"Pengembalian untuk transaksi ID {selected_id} berhasil dicatat!")
                     st.rerun()
 
 if page == "Log":
